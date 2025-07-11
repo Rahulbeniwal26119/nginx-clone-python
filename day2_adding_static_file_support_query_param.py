@@ -21,6 +21,7 @@ handler = logging.StreamHandler()
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
+print("testing reload")
 
 @dataclass
 class Request:
