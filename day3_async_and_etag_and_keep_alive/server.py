@@ -1,9 +1,11 @@
-# Hello Everyone, Welcome to second day of the Nginx clone project.
-# Today we will going to implement the support for query parameter and
-# adding support for static file serving (almost any type).
+# Hello Everyone, welcome to day 3 of the Nginx clone project.
+# Today we are going to add support for:
+# 1. Asynchronous request handling
+# 2. ETag support for caching
+# 3. Keep-Alive connections
 
-# Let's start
-
+# let's start 
+import threading
 import datetime
 import logging
 import json
@@ -12,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import urllib.parse as urlparse
 import mimetypes
+import email.utils
+import hashlib # for digest
 
 # set the logging configuration
 logging.basicConfig(level=logging.INFO)
@@ -51,10 +55,12 @@ HTTP_STATUS_CODES = {
     405: "Method Not Allowed",
     500: "Internal Server Error",
     403: "Forbidden",
+    304: "Not Modified",
+    408: "Request Timeout",
 }
 
 
-def http_response(body, status_code=200, context_type="text/html"):
+def http_response(body, status_code=200, context_type="text/html", extra_headers=None, keep_open=True):
     # let's change this method to always return bytes
 
     if isinstance(body, dict):
@@ -62,13 +68,22 @@ def http_response(body, status_code=200, context_type="text/html"):
         context_type = "application/json"
     elif isinstance(body, str):
         body = body.encode("utf-8")
+    
+    if keep_open:
+        connection = "keep-alive"
+    else:
+        connection = "close"
 
     response_header = [
         f"HTTP/1.1 {status_code} {HTTP_STATUS_CODES.get(status_code, 'Unknown')}",
         f"Content-Type: {context_type}; charset=utf-8",
         f"Content-Length: {len(body)}",
-        "Connection: close",
+        f"Connection: {connection}",
     ]
+    if extra_headers:
+        for k, v in extra_headers.items():
+            response_header.append(f"{k}: {v}")
+
     headers_response = ("\n".join(response_header) + "\n\n").encode("utf-8")
     return headers_response + body
 
@@ -123,8 +138,15 @@ def parse_request(data: bytes, addr):
 
 # Not let's us make a function which will return a response for static files
 
+def make_etag(file_stats):
+    last_modified = file_stats.st_mtime
+    size = file_stats.st_size
+    etag = hashlib.md5(f"{last_modified}-{size}".encode("utf-8")).hexdigest()
+    lm = email.utils.formatdate(last_modified, usegmt=True)
+    return etag, lm
 
-def static_file_response(file_path):
+
+def static_file_response(file_path, request: Request):
     # check if file exists first
     path = Path(file_path).resolve()
     if not path.exists():
@@ -132,6 +154,38 @@ def static_file_response(file_path):
     elif not path.is_relative_to(Path(ROOT).resolve()):
         # if trying to access a file whose permission not granted
         return http_response(HTTP_STATUS_CODES[403], 403, "text/plain")
+    file_stats = path.stat()
+    etag, lm = make_etag(file_stats)
+
+    # check the headers
+    inm = request.headers.get("If-None-Match")
+    ims = request.headers.get("Last-Modified-Since")
+
+    not_modified = False
+    if inm and inm == etag:
+        not_modified = True
+    if ims:
+        # convert LMS to timestamp
+        try:
+            ims_time = email.utils.mktime_tz(email.utils.parsedate_tz(ims))
+            not_modified = int(file_stats.st_mtime) <= int(ims_time)
+        except Exception as e:
+            logger.exception("Failed to validate ims", e)
+            not_modified = False
+    
+    extra_headers = {
+        "ETag": etag,
+        "Last-Modified": lm
+    }
+
+    if not_modified:
+        # No need to server file if not modified
+        return http_response(
+            b"",
+            304, # My Bad it should be 304 instead of 302
+            context_type="text/plain",
+            extra_headers=extra_headers
+        )
 
     # guess the mime type
     mime, _ = mimetypes.guess_type(file_path)
@@ -145,13 +199,44 @@ def static_file_response(file_path):
         content = f.read()
 
     # Ok we are done with this let's make change in main loop
-    return http_response(content, 200, mime)
+    return http_response(content, 200, mime, extra_headers=extra_headers)
 
 
 def http_text_response(file_path):
     with open(file_path, "rb") as f:
         return http_response(f.read(), 200, "text/plain")
 
+def handle_request(client_socket, addr):
+    try:
+        client_socket.settimeout(5)
+        while True:
+            req_data = client_socket.recv(1024)
+            if not req_data:
+                logger.info(f"Connection closed by {addr[0]}")
+                break
+            request = parse_request(req_data, addr)
+
+            if request.handler_function:
+                response = request.handler_function(request)
+            elif request.method == "GET":
+                path = (ROOT / Path(request.path.lstrip("/"))).resolve()
+                if path.is_file():
+                    response = static_file_response(path, request)
+                else:
+                    response = http_response("Path not found", 404, "text/plain")
+            else:
+                response = http_response("Path not found", 404, "text/plain")
+            
+            # we are also going to add support for keep-alive connections
+            # Only close the connection where client requests
+            if request.headers.get("Connection", "") and request.headers["Connection"] == "close":
+                break
+
+            client_socket.sendall(response)
+            logger.info(f"Response sent to {addr[0]}")
+    except socket.timeout:
+        logger.warning(f"Request from {addr[0]} timed out")
+        client_socket.sendall(http_response(HTTP_STATUS_CODES[408], 408, "text/plain"))
 
 logger.info(f"Starting server on {HOST}:{PORT}")
 
@@ -162,22 +247,15 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_server:
     logger.info(f"Server is running on http://{HOST}:{PORT}")
     while True:
         client_socket, addr = tcp_server.accept()
-        with client_socket:
-            req_data = client_socket.recv(1024)
-            if not req_data:
-                continue
-            request = parse_request(req_data, addr)
+        # Run a single thread for single client
+        threading.Thread(
+            target=handle_request,
+            args=(
+                client_socket,
+                addr,
+            ),
+            daemon=True # To ensure thread exists when main thread exists
+        ).start()
 
-            if request.handler_function:
-                response = request.handler_function(request)
-            elif request.method == "GET":
-                path = (ROOT / Path(request.path.lstrip("/"))).resolve()
-                if path.is_file():
-                    response = static_file_response(path)
-                else:
-                    response = http_response("Path not found", 404, "text/plain")
-            else:
-                response = http_response("Path not found", 404, "text/plain")
-
-            client_socket.sendall(response)
-            logger.info(f"Response sent to {addr[0]}")
+# As you can see a new connection is being established to fetch all associated file
+# But we can also re-use the same connection for related css and js files.

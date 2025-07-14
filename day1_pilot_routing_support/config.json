@@ -1,0 +1,10 @@
+{
+    "host": "127.0.0.1",
+    "port": 8000,
+    "root": ".",
+    "routes": {
+        "/": "root_handler",
+        "/hello": "hello_handler",
+        "/time": "time_handler"
+    }
+}
